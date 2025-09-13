@@ -52,10 +52,15 @@ sudo cp lib/fluent/plugin/out_duckdb.rb /etc/fluent/plugin/
   time_col time
   tag_col tag
   record_col record
+  flush_interval 5     # seconds (optional)
+  flush_limit 1000     # number of events (optional)
 </match>
 ```
 
 All columns are customizable. The plugin creates the table if it does not exist.
+
+`flush_interval` and `flush_limit` control buffering behavior for bulk insertion.
+The plugin flushes buffered events when either threshold is reached.
 
 ---
 
@@ -73,7 +78,8 @@ The plugin defines the table schema as follows:
 
 ## Notes on Encoding
 
-The plugin uses `Yajl` for JSON encoding unconditionally. No configuration is needed. If `yajl-ruby` is missing, encoding will fail at runtime.
+The plugin uses `Yajl` for JSON encoding.
+Encoding is automatic and unconditional. If `yajl-ruby` is not installed, it will raise an error.
 
 ---
 

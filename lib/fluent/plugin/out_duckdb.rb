@@ -3,6 +3,7 @@ require "duckdb"
 require "yajl"
 require "json"
 require "stringio"
+require "thread"
 
 module Fluent::Plugin
   class DuckdbOutput < Fluent::Plugin::Output
@@ -25,6 +26,11 @@ module Fluent::Plugin
     desc "Format for timestamp conversion"
     config_param :time_format, :string, default: "%F %T.%N %z"
 
+    desc "Maximum number of records before flush"
+    config_param :flush_size, :integer, default: 1000
+    desc "Maximum flush interval in seconds"
+    config_param :flush_interval, :time, default: 5
+
     config_section :buffer do
       config_set_default :@type, DEFAULT_BUFFER_TYPE
       config_set_default :chunk_keys, ["tag"]
@@ -41,14 +47,22 @@ module Fluent::Plugin
     def start
       super
       init_connection
-      @appender = @con.appender(@table)
+      @buffer = []
+      @mutex = Mutex.new
+      @last_flush_time = Fluent::Engine.now
+
+      @flush_thread = thread_create(:duckdb_flush_thread) do
+        loop do
+          sleep 1
+          now = Fluent::Engine.now
+          flush_if_necessary(now)
+        end
+      end
     end
 
     def shutdown
-      if @appender
-        @appender.flush
-        @appender.close
-      end
+      @flush_thread&.kill
+      flush_all
       @con.close if @con
       @db.close if @db
       super
@@ -56,25 +70,27 @@ module Fluent::Plugin
 
     def write(chunk)
       tag = chunk.metadata.tag
+      now = Fluent::Engine.now
 
       chunk.each do |time, record|
-        @appender.begin_row
-        @appender.append(tag)
-        @appender.append(Time.at(time).strftime(@time_format))
-        @appender.append(Yajl.dump(record))
-        @appender.end_row
+        entry = [
+          tag,
+          Time.at(time).strftime(@time_format),
+          Yajl.dump(record)
+        ]
+        @mutex.synchronize { @buffer << entry }
       end
 
-      @appender.flush
+      flush_if_necessary(now)
     end
 
     private
+
     def init_connection
       return if @con
       @db = DuckDB::Database.open(@database)
       @con = @db.connect
 
-      # Create table if missing
       @con.query <<~SQL
         CREATE TABLE IF NOT EXISTS #{@table} (
           #{@tag_col}    VARCHAR,
@@ -82,6 +98,46 @@ module Fluent::Plugin
           #{@record_col} JSON
         )
       SQL
+    end
+
+    def flush_if_necessary(now)
+      should_flush = false
+      batch = nil
+
+      @mutex.synchronize do
+        if @buffer.size >= @flush_size || (now - @last_flush_time) >= @flush_interval
+          batch = @buffer.dup
+          @buffer.clear
+          @last_flush_time = now
+          should_flush = true
+        end
+      end
+
+      flush_batch(batch) if should_flush && batch
+    end
+
+    def flush_all
+      batch = nil
+      @mutex.synchronize do
+        batch = @buffer.dup unless @buffer.empty?
+        @buffer.clear
+      end
+      flush_batch(batch) if batch
+    end
+
+    def flush_batch(batch)
+      return if batch.empty?
+
+      appender = @con.appender(@table)
+      batch.each do |tag, time_str, json|
+        appender.begin_row
+        appender.append(tag)
+        appender.append(time_str)
+        appender.append(json)
+        appender.end_row
+      end
+      appender.flush
+      appender.close
     end
   end
 end
