@@ -1,96 +1,152 @@
-# Fluent::Plugin::PgJson, a plugin for [Fluentd](http://fluentd.org)
+# fluent-plugin-duckdb
 
-![linux](https://github.com/fluent-plugins-nursery/fluent-plugin-pgjson/workflows/linux/badge.svg?branch=master)
+Fluentd output plugin for [DuckDB](https://duckdb.org).
+Stores Fluentd events into a DuckDB database using a JSON column, allowing you to run rich SQL queries directly on logs.
 
-Output Plugin for PostgreSQL Json Type.
-
-<b>Json type is availble in PostgreSQL version over 9.2</b>
+---
 
 ## Requirements
 
-| fluent-plugin-pgjson | fluentd    | Ruby   |
-|----------------------|------------|--------|
-| >= 1.0.0             | >= v1.0.0  | >= 2.2 |
-|  < 1.0.0             | >= v0.12.0 | >= 1.9 |
+| fluent-plugin-duckdb | Fluentd | Ruby   | DuckDB           |
+| -------------------- | ------- | ------ | ---------------- |
+| >= 0.1.0             | >= v1.0 | >= 2.5 | >= 1.3.1 (C API) |
+
+---
+
+## Pre-requisites (Linux)
+
+The [Ruby `duckdb`](https://rubygems.org/gems/duckdb) gem depends on the **DuckDB C API**. Install the shared library and headers first:
+
+```bash
+wget https://github.com/duckdb/duckdb/releases/download/v1.3.1/libduckdb-linux-amd64.zip
+unzip libduckdb-linux-amd64.zip -d libduckdb
+sudo mv libduckdb/duckdb.* /usr/local/include/
+sudo mv libduckdb/libduckdb.so /usr/local/lib/
+sudo ldconfig /usr/local/lib
+```
+
+---
 
 ## Installation
 
+```bash
+sudo fluent-gem install duckdb -v 1.3.1.0
+sudo fluent-gem install yajl-ruby
 ```
-$ fluent-gem install fluent-plugin-pgjson
+
+Then copy the plugin into Fluentd's plugin directory:
+
+```bash
+sudo cp lib/fluent/plugin/out_duckdb.rb /etc/fluent/plugin/
 ```
 
-## Schema
-
-Specified table must have following schema:
-
-| col          | type                     |
-|--------------|--------------------------|
-| {tag_col}    | Text                     |
-| {time_col}   | Timestamp WITH TIME ZONE |
-| {record_col} | Json                     |
-
-### Example
-
-```
-CREATE TABLE fluentd (
-    tag Text
-    ,time Timestamptz
-    ,record Json
-);
-```
-### JSONB?
-
-Yes! Just define a record column as JSONB type.
-
-```
-CREATE TABLE fluentd (
-    tag Text
-    ,time Timestamptz
-    ,record Jsonb
-);
-```
+---
 
 ## Configuration
 
-### Example
-
-```
+```xml
 <match **>
-  @type pgjson
-  #host localhost
-  #port 5432
-  #sslmode prefer
-  database fluentd
-  table fluentd
-  user postgres
-  password postgres
-  #time_col time
-  #tag_col tag
-  #record_col record
-  #msgpack false
-  #encoder yajl
+  @type duckdb
+  database /var/log/ducklogs.duckdb
+  table fluentd_events
+  time_col time
+  tag_col tag
+  record_col record
 </match>
 ```
 
-### Parameter
+All columns are customizable. The plugin creates the table if it does not exist.
 
-|parameter|description|default|
-|---|---|---|
-|host|The hostname of PostgreSQL server|localhost|
-|port|The port of PostgreSQL server|5432|
-|sslmode|Set the sslmode to enable Eavesdropping protection/MITM protection. See [PostgreSQL Documentation](https://www.postgresql.org/docs/10/static/libpq-ssl.html) for more details. (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`)|`prefer`|
-|database|The database name to connect||
-|table|The table name to insert records||
-|user|The user name to connect database|nil|
-|password|The password to connect database|nil|
-|time_col|The column name for the time|`time`|
-|tag_col|The column name for the tag|`tag`|
-|record_col|The column name for the record|`record`|
-|msgpack|If true, insert records formatted as msgpack|`false`|
-|encoder|JSON encoder (`yajl`, `json`)|`yajl`|
+---
 
-## Copyright
+## Schema
 
-* Copyright (c) 2014- OKUNO Akihiro
-* License
-    * Apache License, version 2.0
+The plugin defines the table schema as follows:
+
+| Column   | Type      |
+| -------- | --------- |
+| `tag`    | VARCHAR   |
+| `time`   | TIMESTAMP |
+| `record` | JSON      |
+
+---
+
+## Notes on Encoding
+
+The plugin uses `Yajl` for JSON encoding unconditionally. No configuration is needed. If `yajl-ruby` is missing, encoding will fail at runtime.
+
+---
+
+## Querying Example
+
+```sql
+SELECT record->>'$.user.id' AS user_id
+FROM fluentd_events
+WHERE record->>'$.event' = 'login';
+
+SELECT record->>'$.host' AS host, COUNT(*) AS c
+FROM fluentd_events
+GROUP BY host;
+```
+
+---
+
+## Smoke Test
+
+### 1. Minimal Config with Dummy Input
+
+```xml
+<source>
+  @type dummy
+  tag test.duckdb
+  auto_increment_key id
+  rate 1
+  dummy [
+    {"event":"login","user":{"id":123,"name":"alice"}},
+    {"event":"logout","user":{"id":456,"name":"bob"}}
+  ]
+</source>
+
+<match test.duckdb>
+  @type duckdb
+  database /tmp/fluentd.duckdb
+  table fluentd_events
+</match>
+```
+
+### 2. Run Fluentd
+
+```bash
+fluentd -c fluent.conf -vv
+```
+
+### 3. Inspect Results
+
+```bash
+duckdb /tmp/fluentd.duckdb
+
+SELECT record->>'$.user.name', record->>'$.event' FROM fluentd_events;
+```
+
+---
+
+## Testing
+
+Use the included test with `test-unit` and `fluent/test/driver/output`.
+
+```bash
+bundle install
+rake test
+```
+
+Example test verifies correct insertion and retrieval using JSON path queries:
+
+```ruby
+SELECT record->>'$.user.id' FROM test_events;
+```
+
+---
+
+## License
+
+Apache License 2.0
