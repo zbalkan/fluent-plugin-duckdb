@@ -1,9 +1,9 @@
-require "fluent/plugin/output"
-require "duckdb"
-require "yajl"
-require "json"
-require "stringio"
-require "thread"
+# lib/fluent/plugin/out_duckdb.rb
+require 'fluent/plugin/output'
+require 'duckdb'
+require 'yajl'
+require 'digest'
+require 'fluent/error'
 
 module Fluent::Plugin
   class DuckdbOutput < Fluent::Plugin::Output
@@ -11,8 +11,7 @@ module Fluent::Plugin
 
     helpers :compat_parameters
 
-    DEFAULT_BUFFER_TYPE = "memory"
-
+    # ---- Configuration ----
     desc "The DuckDB database file path (use ':memory:' for in-memory)"
     config_param :database, :string, default: ":memory:"
     desc "The table name to insert records"
@@ -23,121 +22,169 @@ module Fluent::Plugin
     config_param :tag_col, :string, default: "tag"
     desc "The column name for the record"
     config_param :record_col, :string, default: "record"
-    desc "Format for timestamp conversion"
-    config_param :time_format, :string, default: "%F %T.%N %z"
+    config_param :dedupe, :bool, default: true
 
-    desc "Maximum number of records before flush"
-    config_param :flush_size, :integer, default: 1000
-    desc "Maximum flush interval in seconds"
-    config_param :flush_interval, :time, default: 5
-
+    # Delegate buffering/retries to Fluentd
     config_section :buffer do
-      config_set_default :@type, DEFAULT_BUFFER_TYPE
-      config_set_default :chunk_keys, ["tag"]
+      # sensible default; users may override in fluent.conf
+      config_set_default :chunk_keys, ['time','tag']
     end
 
-    def configure(conf)
-      compat_parameters_convert(conf, :buffer)
-      super
-      unless @chunk_key_tag
-        raise Fluent::ConfigError, "'tag' in chunk_keys is required."
-      end
-    end
+    # DuckDB prefers a single writer
+    def multi_workers_ready?; false; end
 
+    # ---- Lifecycle ----
     def start
       super
-      init_connection
-      @buffer = []
-      @mutex = Mutex.new
-      @last_flush_time = Fluent::Engine.now
-
-      @flush_thread = thread_create(:duckdb_flush_thread) do
-        loop do
-          sleep 1
-          now = Fluent::Engine.now
-          flush_if_necessary(now)
-        end
-      end
+      connect_database
+      ensure_schema
+      prepare_statements
     end
 
     def shutdown
-      @flush_thread&.kill
-      flush_all
-      @con.close if @con
-      @db.close if @db
+      finalize_statements
+      close_database
       super
     end
 
+    # ---- Main write path (one transaction per chunk) ----
     def write(chunk)
-      tag = chunk.metadata.tag
-      now = Fluent::Engine.now
-
-      chunk.each do |time, record|
-        entry = [
-          tag,
-          Time.at(time).strftime(@time_format),
-          Yajl.dump(record)
-        ]
-        @mutex.synchronize { @buffer << entry }
-      end
-
-      flush_if_necessary(now)
+      tag  = chunk.metadata.tag
+      rows = build_rows(chunk, tag)
+      with_transaction { insert_rows(rows) }
+    rescue => e
+      rollback_if_needed
+      raise  # let Fluentd buffer handle retries/backoff
     end
 
     private
 
-    def init_connection
+    # ===== Connection lifecycle =====
+    def connect_database
       return if @con
       @db = DuckDB::Database.open(@database)
       @con = @db.connect
-
-      @con.query <<~SQL
-        CREATE TABLE IF NOT EXISTS #{@table} (
-          #{@tag_col}    VARCHAR,
-          #{@time_col}   TIMESTAMP,
-          #{@record_col} JSON
-        )
-      SQL
     end
 
-    def flush_if_necessary(now)
-      should_flush = false
-      batch = nil
+    def close_database
+      @con&.close
+      @db&.close
+    end
 
-      @mutex.synchronize do
-        if @buffer.size >= @flush_size || (now - @last_flush_time) >= @flush_interval
-          batch = @buffer.dup
-          @buffer.clear
-          @last_flush_time = now
-          should_flush = true
+    # ===== Schema & prepared statements =====
+    def ensure_schema
+      ddl = <<~SQL
+        CREATE TABLE IF NOT EXISTS #{@table} (
+          #{@tag_col} VARCHAR,
+          #{@time_col} TIMESTAMP,   -- stored as UTC with up to 9-digit fractional seconds
+          #{@record_col} JSON
+          #{ dedupe? ? ", record_hash VARCHAR, UNIQUE(#{@tag_col}, #{@time_col}, record_hash)" : "" }
+        );
+      SQL
+      @con.query(ddl)
+    end
+
+    def prepare_statements
+      @insert_sql  = build_insert_sql
+      @insert_stmt = @con.prepare(@insert_sql)
+    end
+
+    def finalize_statements
+      @insert_stmt&.destroy
+      @insert_stmt = nil
+    end
+
+    def build_insert_sql
+      if dedupe?
+        "INSERT INTO #{@table}(#{@tag_col}, #{@time_col}, #{@record_col}, record_hash)
+         VALUES (?, CAST(? AS TIMESTAMP), CAST(? AS JSON), ?)"
+      else
+        "INSERT INTO #{@table}(#{@tag_col}, #{@time_col}, #{@record_col})
+         VALUES (?, CAST(? AS TIMESTAMP), CAST(? AS JSON))"
+      end
+    end
+
+    def schema_fatal?(e)
+      msg = e.message.downcase
+      msg.include?('type mismatch') || msg.include?('invalid json')
+    end
+
+    # ===== Chunk → rows =====
+    def build_rows(chunk, tag)
+      rows = []
+      chunk.each do |time, record|
+        ts_str = encode_timestamp(time)      # UTC ISO-like string with 9-digit ns
+        json   = encode_record_json(record)  # JSON text
+        if dedupe?
+          rh = compute_record_hash(tag, ts_str, json)
+          rows << [tag, ts_str, json, rh]
+        else
+          rows << [tag, ts_str, json]
         end
       end
-
-      flush_batch(batch) if should_flush && batch
+      rows
     end
 
-    def flush_all
-      batch = nil
-      @mutex.synchronize do
-        batch = @buffer.dup unless @buffer.empty?
-        @buffer.clear
-      end
-      flush_batch(batch) if batch
+    def encode_timestamp(time)
+      # Preserve nanoseconds by formatting explicitly.
+      sec  = time.to_i
+      nsec = time.nsec
+      base = Time.at(sec, 0).utc.strftime("%Y-%m-%d %H:%M:%S")
+      "#{base}.#{sprintf('%09d', nsec)}Z"
     end
 
-    def flush_batch(batch)
-      return if batch.empty?
+    def encode_record_json(record)
+      Yajl::Encoder.encode(record)
+    end
 
-      appender = @con.appender(@table)
-      batch.each do |tag, time_str, json|
-        appender.begin_row
-        appender.append(tag)
-        appender.append(time_str)
-        appender.append(json)
-        appender.end_row
+    def compute_record_hash(tag, ts, json)
+      Digest::SHA256.hexdigest("#{tag}|#{ts}|#{json}")
+    end
+
+    def dedupe?
+      @dedupe
+    end
+
+    # ===== Transactions & inserts =====
+    def with_transaction
+      begin_transaction
+      yield
+      commit_transaction
+    end
+
+    def begin_transaction
+      @con.query('BEGIN')
+      @in_tx = true
+    end
+
+    def commit_transaction
+      @con.query('COMMIT')
+      @in_tx = false
+    end
+
+    def rollback_if_needed
+      return unless @in_tx
+      @con.query('ROLLBACK') rescue nil
+      @in_tx = false
+    end
+
+    def insert_rows(rows)
+      if dedupe?
+        rows.each do |tag, ts, rec, rh|
+          @insert_stmt.bind(1, tag)
+          @insert_stmt.bind(2, ts)
+          @insert_stmt.bind(3, rec)
+          @insert_stmt.bind(4, rh)
+          @insert_stmt.execute
+        end
+      else
+        rows.each do |tag, ts, rec|
+          @insert_stmt.bind(1, tag)
+          @insert_stmt.bind(2, ts)
+          @insert_stmt.bind(3, rec)
+          @insert_stmt.execute
+        end
       end
-      appender.flush
-      appender.close
     end
   end
 end

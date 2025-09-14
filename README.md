@@ -44,6 +44,8 @@ sudo cp lib/fluent/plugin/out_duckdb.rb /etc/fluent/plugin/
 
 ## Configuration
 
+> This output is **buffered**. Buffering, flushing cadence, and retries are controlled by Fluentd’s `<buffer>` section. The plugin inserts each chunk in a single DuckDB transaction. You can use a buffer or storage plugin for high volume buffer needs.
+
 ```xml
 <match **>
   @type duckdb
@@ -52,15 +54,20 @@ sudo cp lib/fluent/plugin/out_duckdb.rb /etc/fluent/plugin/
   time_col time
   tag_col tag
   record_col record
-  flush_interval 5     # seconds (optional)
-  flush_limit 1000     # number of events (optional)
+  # Optional: dedupe true enables idempotent inserts via a unique hash
+  # dedupe true
+
+  # Buffering is handled by Fluentd:
+  <buffer tag,time>
+    @type memory
+    timekey 30s
+    timekey_wait 5s
+    # add further buffer settings (flush_interval, retry, file buffer, etc.) as needed
+  </buffer>
 </match>
 ```
 
 All columns are customizable. The plugin creates the table if it does not exist.
-
-`flush_interval` and `flush_limit` control buffering behavior for bulk insertion.
-The plugin flushes buffered events when either threshold is reached.
 
 ---
 
@@ -73,6 +80,8 @@ The plugin defines the table schema as follows:
 | `tag`    | VARCHAR   |
 | `time`   | TIMESTAMP |
 | `record` | JSON      |
+
+If `dedupe true` is set, the plugin also adds an internal `record_hash` column and a `UNIQUE(tag, time, record_hash)` constraint to make retries idempotent.
 
 ---
 
@@ -117,6 +126,12 @@ GROUP BY host;
   @type duckdb
   database /tmp/fluentd.duckdb
   table fluentd_events
+
+  <buffer tag,time>
+    @type memory
+    timekey 30s
+    timekey_wait 5s
+  </buffer>
 </match>
 ```
 
