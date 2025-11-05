@@ -126,15 +126,35 @@ module Fluent::Plugin
     end
 
     def encode_timestamp(time)
-      # Preserve nanoseconds by formatting explicitly.
-      sec  = time.to_i
-      nsec = time.nsec
+      # Ensure we always have a Time object
+      t = time.is_a?(Time) ? time : Time.at(time).utc
+      sec  = t.to_i
+      nsec = t.nsec
       base = Time.at(sec, 0).utc.strftime("%Y-%m-%d %H:%M:%S")
       "#{base}.#{sprintf('%09d', nsec)}Z"
     end
 
+    def deep_parse_json(value)
+      case value
+      when Hash
+        value.transform_values { |v| deep_parse_json(v) }
+      when Array
+        value.map { |v| deep_parse_json(v) }
+      when String
+        begin
+          parsed = Yajl::Parser.parse(value)
+          parsed.is_a?(Hash) || parsed.is_a?(Array) ? deep_parse_json(parsed) : value
+        rescue
+          value
+        end
+      else
+        value
+      end
+    end
+
     def encode_record_json(record)
-      Yajl::Encoder.encode(record)
+      parsed_record = deep_parse_json(record)
+      Yajl::Encoder.encode(parsed_record)
     end
 
     def compute_record_hash(tag, ts, json)
