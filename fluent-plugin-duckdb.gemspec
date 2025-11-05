@@ -19,7 +19,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "fluentd", ">= 1.0"
-  spec.add_dependency "duckdb", ">= 1.3.1.0"
+  spec.add_dependency "duckdb", ">= 1.4.1.0"
   spec.add_dependency "yajl-ruby", ">= 1.3"
 
   spec.add_development_dependency "rake", ">= 12"

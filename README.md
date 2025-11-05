@@ -9,7 +9,7 @@ Stores Fluentd events into a DuckDB database using a JSON column, allowing you t
 
 | fluent-plugin-duckdb | Fluentd | Ruby   | DuckDB           |
 | -------------------- | ------- | ------ | ---------------- |
-| >= 0.1.0             | >= v1.0 | >= 2.5 | >= 1.3.1 (C API) |
+| >= 0.1.0             | >= v1.0 | >= 2.5 | >= 1.4.1 (C API) |
 
 ---
 
@@ -18,7 +18,7 @@ Stores Fluentd events into a DuckDB database using a JSON column, allowing you t
 The [Ruby `duckdb`](https://rubygems.org/gems/duckdb) gem depends on the **DuckDB C API**. Install the shared library and headers first:
 
 ```bash
-wget https://github.com/duckdb/duckdb/releases/download/v1.3.1/libduckdb-linux-amd64.zip
+wget https://github.com/duckdb/duckdb/releases/download/v1.4.1/libduckdb-linux-amd64.zip
 unzip libduckdb-linux-amd64.zip -d libduckdb
 sudo mv libduckdb/duckdb.* /usr/local/include/
 sudo mv libduckdb/libduckdb.so /usr/local/lib/
@@ -30,7 +30,7 @@ sudo ldconfig /usr/local/lib
 ## Installation
 
 ```bash
-sudo fluent-gem install duckdb -v 1.3.1.0
+sudo fluent-gem install duckdb -v 1.4.1.0
 sudo fluent-gem install yajl-ruby
 ```
 
